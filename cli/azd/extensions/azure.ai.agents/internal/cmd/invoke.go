@@ -49,6 +49,10 @@ type invokeFlags struct {
 	callID          string
 	clientHeaders   []string
 	background      bool
+	noWait          bool
+	continueRun     bool
+	cancel          bool
+	agentName       string
 }
 
 // outputRaw is the sentinel value of the inherited --output flag that selects
@@ -124,8 +128,11 @@ header). Friendly summary lines like "Session:" and "Invocation:" are
 suppressed in raw mode.
 
 Use --background with the Responses protocol to start stored background work
-and remain attached until it finishes. Background invocation is remote-only,
-does not support raw output, and is not bounded by --timeout.`,
+and remain attached until it finishes. Add --no-wait to return after azd saves
+the Response identity. Use message-free --continue to follow saved work and
+--cancel to cancel it. In multi-agent projects, use --agent-name with these
+message-free operations. Background invocation is remote-only, does not support
+raw output, and is not bounded by --timeout.`,
 		Example: `  # Invoke the remote agent on Foundry (auto-detects agent from azure.yaml)
   azd ai agent invoke "Hello!"
 
@@ -155,6 +162,16 @@ does not support raw output, and is not bounded by --timeout.`,
 
   # Start stored background work and remain attached until it finishes
   azd ai agent invoke --background "Run the long task"
+
+  # Start background work, save its identity, and return immediately
+  azd ai agent invoke --background --no-wait "Run the long task"
+
+  # Follow or cancel the saved background Response
+  azd ai agent invoke --continue
+  azd ai agent invoke --cancel
+
+  # Select an agent for a message-free lifecycle operation
+  azd ai agent invoke --continue --agent-name my-agent
 
   # Start a new session (discard conversation history)
   azd ai agent invoke --new-session "Hello!"
@@ -194,7 +211,17 @@ does not support raw output, and is not bounded by --timeout.`,
 					flags.message = args[0]
 				}
 			case 0:
-				// Only valid when -f is provided
+				// Message-free lifecycle operations are validated below.
+			}
+			if flags.agentName != "" {
+				if flags.name != "" {
+					return exterrors.Validation(
+						exterrors.CodeInvalidParameter,
+						"--agent-name cannot be combined with a positional agent name",
+						"use only --agent-name for message-free lifecycle operations",
+					)
+				}
+				flags.name = flags.agentName
 			}
 
 			action := &InvokeAction{flags: flags, noPrompt: extCtx.NoPrompt}
@@ -221,11 +248,48 @@ does not support raw output, and is not bounded by --timeout.`,
 					"provide either a message argument or --input-file, not both",
 				)
 			}
-			if flags.inputFile == "" && flags.message == "" {
+			messageFreeLifecycle := flags.continueRun || flags.cancel
+			if flags.inputFile == "" && flags.message == "" && !messageFreeLifecycle {
 				return exterrors.Validation(
 					exterrors.CodeInvalidParameter,
 					"a message argument or --input-file is required",
 					"provide a message as a positional argument, or use --input-file/-f to send a file",
+				)
+			}
+			if flags.continueRun && flags.cancel {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"--continue and --cancel are mutually exclusive",
+					"choose one lifecycle operation",
+				)
+			}
+			if flags.noWait && !flags.background {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"--no-wait requires --background",
+					"add --background or remove --no-wait",
+				)
+			}
+			if (flags.continueRun || flags.cancel) && (flags.message != "" || flags.inputFile != "") {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"message-bearing --continue and --cancel are not available yet",
+					"remove the message to follow or cancel the saved Response",
+				)
+			}
+			if (flags.continueRun || flags.cancel) &&
+				(flags.session != "" || flags.newSession || flags.conversation != "" || flags.newConversation) {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"--continue and --cancel use the saved session and conversation",
+					"remove session and conversation overrides",
+				)
+			}
+			if flags.background && (flags.continueRun || flags.cancel) {
+				return exterrors.Validation(
+					exterrors.CodeInvalidParameter,
+					"--background cannot be combined with --continue or --cancel",
+					"choose one lifecycle operation",
 				)
 			}
 
@@ -269,7 +333,7 @@ does not support raw output, and is not bounded by --timeout.`,
 			}
 			action.clientHeaders = clientHeaders
 
-			if flags.background {
+			if flags.background || flags.continueRun || flags.cancel {
 				if flags.local {
 					return exterrors.Validation(
 						exterrors.CodeInvalidParameter,
@@ -280,14 +344,14 @@ does not support raw output, and is not bounded by --timeout.`,
 				if flags.outputFmt == outputRaw {
 					return exterrors.Validation(
 						exterrors.CodeInvalidParameter,
-						"--output raw is not supported with --background",
-						"remove --output raw so azd can save the Response identity and cursor",
+						"--output raw is not supported with background lifecycle operations",
+						"remove --output raw so azd can manage the Response identity and cursor",
 					)
 				}
 				if flags.agentEndpoint != "" {
 					return exterrors.Validation(
 						exterrors.CodeInvalidParameter,
-						"--background is not supported with --agent-endpoint",
+						"background lifecycle operations are not supported with --agent-endpoint",
 						"run from the azd project so the background Response state can be saved",
 					)
 				}
@@ -348,6 +412,10 @@ does not support raw output, and is not bounded by --timeout.`,
 		false,
 		"Run a stored background Response and remain attached until it finishes",
 	)
+	cmd.Flags().BoolVar(&flags.noWait, "no-wait", false, "Return after the background Response identity is saved")
+	cmd.Flags().BoolVar(&flags.continueRun, "continue", false, "Follow the saved current background Response")
+	cmd.Flags().BoolVar(&flags.cancel, "cancel", false, "Cancel the saved current background Response")
+	cmd.Flags().StringVar(&flags.agentName, "agent-name", "", "Agent name for a message-free lifecycle operation")
 
 	// Register `raw` as an additional allowed value on the inherited global
 	// --output/-o flag. The extension SDK forbids extensions from registering
@@ -469,10 +537,10 @@ func (a *InvokeAction) Run(ctx context.Context) error {
 	// populated, but a2aRemote never calls applyCustomHeaders — the headers
 	// would be silently dropped, which is the exact silent no-op the guard
 	// intends to prevent.
-	if a.flags.background && protocol != agent_api.AgentProtocolResponses {
+	if (a.flags.background || a.flags.continueRun || a.flags.cancel) && protocol != agent_api.AgentProtocolResponses {
 		return exterrors.Validation(
 			exterrors.CodeInvalidParameter,
-			fmt.Sprintf("--background is not supported with the %s protocol", protocol),
+			fmt.Sprintf("background lifecycle operations are not supported with the %s protocol", protocol),
 			"use a deployed Responses agent or remove --background",
 		)
 	}
@@ -504,6 +572,12 @@ func (a *InvokeAction) Run(ctx context.Context) error {
 	case agent_api.AgentProtocolA2A:
 		return a.a2aRemote(ctx)
 	default:
+		if a.flags.continueRun {
+			return a.responsesContinueRemote(ctx)
+		}
+		if a.flags.cancel {
+			return a.responsesCancelRemote(ctx)
+		}
 		return a.responsesRemote(ctx)
 	}
 }
@@ -1173,11 +1247,13 @@ func (a *InvokeAction) responsesRemote(ctx context.Context) error {
 	}
 
 	var responseStore responseStateStore
-	if a.flags.background {
-		if rc.azdClient == nil || agentKey == "" {
-			return fmt.Errorf("background Responses require project-backed local state")
-		}
+	if rc.azdClient != nil && agentKey != "" {
 		responseStore = newUserConfigResponseStateStore(rc.azdClient)
+		if err := guardNoActiveBackgroundResponse(ctx, responseStore, agentKey); err != nil {
+			return err
+		}
+	} else if a.flags.background {
+		return fmt.Errorf("background Responses require project-backed local state")
 	}
 
 	// Acquire the bearer token after body validation so a local input error
@@ -1327,6 +1403,12 @@ func (a *InvokeAction) responsesRemote(ctx context.Context) error {
 		a.emitInvokeFailureNextStep(nextstep.InvokeRemote, rc.nextStepName(), resp.Header.Get("x-adc-response-details"))
 		return fmt.Errorf("POST %s failed with HTTP %d: %s\n%s", respURL, resp.StatusCode, resp.Status, string(respBody))
 	}
+	if !a.flags.background && responseStore != nil {
+		if err := responseStore.Delete(ctx, agentKey); err != nil {
+			return fmt.Errorf("clear previous background Response: %w", err)
+		}
+	}
+
 	// Parse SSE stream for agent output.
 	if !a.flags.background {
 		if err := readResponsesSSE(ctx, resp.Body, os.Stdout, rc.name, false, nil); err != nil {
@@ -1338,6 +1420,7 @@ func (a *InvokeAction) responsesRemote(ctx context.Context) error {
 			effectiveSessionID = assigned
 		}
 		var printedResponseID string
+		var savedStatus string
 		onProgress := func(progress responsesStreamProgress) error {
 			if progress.ResponseID == "" {
 				return nil
@@ -1346,16 +1429,27 @@ func (a *InvokeAction) responsesRemote(ctx context.Context) error {
 				fmt.Printf("Response:     %s\n", progress.ResponseID)
 				printedResponseID = progress.ResponseID
 			}
-			return responseStore.Save(ctx, agentKey, savedBackgroundResponse{
+			savedStatus = progress.Status
+			if err := responseStore.Save(ctx, agentKey, savedBackgroundResponse{
 				ResponseID:     progress.ResponseID,
 				Cursor:         progress.Cursor,
 				Status:         progress.Status,
 				SessionID:      effectiveSessionID,
 				ConversationID: convID,
-			})
+			}); err != nil {
+				return err
+			}
+			if a.flags.noWait {
+				return errBackgroundNoWait
+			}
+			return nil
 		}
 		if err := readResponsesSSE(ctx, resp.Body, os.Stdout, rc.name, true, onProgress); err != nil {
-			return err
+			if !errors.Is(err, errBackgroundNoWait) {
+				return err
+			}
+			fmt.Printf("\nStatus: %s\n\nNext:\n  azd ai agent invoke --continue\n", savedStatus)
+			return nil
 		}
 	}
 	totalDuration := time.Since(invokeStart)

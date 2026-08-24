@@ -36,7 +36,7 @@ func TestInvokeCommandBackgroundValidation(t *testing.T) {
 		{
 			name: "rejects explicit invocations protocol",
 			args: []string{"--background", "--protocol", "invocations", "hello"},
-			want: "--background is not supported with the invocations protocol",
+			want: "background lifecycle operations are not supported with the invocations protocol",
 		},
 	}
 
