@@ -131,8 +131,10 @@ Use --background with the Responses protocol to start stored background work
 and remain attached until it finishes. Add --no-wait to return after azd saves
 the Response identity. Use message-free --continue to follow saved work and
 --cancel to cancel it. In multi-agent projects, use --agent-name with these
-message-free operations. Background invocation is remote-only, does not support
-raw output, and is not bounded by --timeout.`,
+message-free operations. For remote Invocations agents, message-free --continue
+performs one best-effort GET of the latest saved invocation without polling or
+interpreting its lifecycle. Background invocation is remote-only, does not
+support raw output, and is not bounded by --timeout.`,
 		Example: `  # Invoke the remote agent on Foundry (auto-detects agent from azure.yaml)
   azd ai agent invoke "Hello!"
 
@@ -172,6 +174,9 @@ raw output, and is not bounded by --timeout.`,
 
   # Select an agent for a message-free lifecycle operation
   azd ai agent invoke --continue --agent-name my-agent
+
+  # Retrieve the latest saved Invocation once (no polling or replay guarantee)
+  azd ai agent invoke --protocol invocations --continue --agent-name my-agent
 
   # Start a new session (discard conversation history)
   azd ai agent invoke --new-session "Hello!"
@@ -413,7 +418,12 @@ raw output, and is not bounded by --timeout.`,
 		"Run a stored background Response and remain attached until it finishes",
 	)
 	cmd.Flags().BoolVar(&flags.noWait, "no-wait", false, "Return after the background Response identity is saved")
-	cmd.Flags().BoolVar(&flags.continueRun, "continue", false, "Follow the saved current background Response")
+	cmd.Flags().BoolVar(
+		&flags.continueRun,
+		"continue",
+		false,
+		"Follow the saved background Response or retrieve the latest saved Invocation once",
+	)
 	cmd.Flags().BoolVar(&flags.cancel, "cancel", false, "Cancel the saved current background Response")
 	cmd.Flags().StringVar(&flags.agentName, "agent-name", "", "Agent name for a message-free lifecycle operation")
 
@@ -538,11 +548,15 @@ func (a *InvokeAction) Run(ctx context.Context) error {
 	// would be silently dropped, which is the exact silent no-op the guard
 	// intends to prevent.
 	if (a.flags.background || a.flags.continueRun || a.flags.cancel) && protocol != agent_api.AgentProtocolResponses {
-		return exterrors.Validation(
-			exterrors.CodeInvalidParameter,
-			fmt.Sprintf("background lifecycle operations are not supported with the %s protocol", protocol),
-			"use a deployed Responses agent or remove --background",
-		)
+		invocationsGet := protocol == agent_api.AgentProtocolInvocations && a.flags.continueRun &&
+			!a.flags.background && !a.flags.cancel && a.flags.message == "" && a.flags.inputFile == ""
+		if !invocationsGet {
+			return exterrors.Validation(
+				exterrors.CodeInvalidParameter,
+				fmt.Sprintf("background lifecycle operations are not supported with the %s protocol", protocol),
+				"use a deployed Responses agent or remove the lifecycle flags",
+			)
+		}
 	}
 
 	if len(a.clientHeaders) > 0 && protocol == agent_api.AgentProtocolA2A {
@@ -568,6 +582,9 @@ func (a *InvokeAction) Run(ctx context.Context) error {
 	// Remote: route by protocol.
 	switch protocol {
 	case agent_api.AgentProtocolInvocations:
+		if a.flags.continueRun {
+			return a.invocationsContinueRemote(ctx)
+		}
 		return a.invocationsRemote(ctx)
 	case agent_api.AgentProtocolA2A:
 		return a.a2aRemote(ctx)
@@ -1659,15 +1676,25 @@ func (a *InvokeAction) invocationsRemote(ctx context.Context) error {
 	ttfb := time.Since(invokeStart)
 	defer resp.Body.Close()
 
-	// Print the invocation ID if the agent returned one. We do not persist it
-	// to the per-user config: the config store only supports the "sessions"
-	// and "conversations" maps (see validateStoreField), and invocation IDs
-	// are not used to drive any subsequent invoke -- they are emitted purely
-	// for trace correlation.
-	if !raw {
-		if invID := resp.Header.Get("x-agent-invocation-id"); invID != "" {
-			fmt.Printf("Invocation:   %s\n", invID)
+	// Capture the invocation ID for diagnostics and best-effort later retrieval.
+	// The AgentServer adapter normally returns the ID in a header; asynchronous
+	// implementations may return it only in the 202 response body.
+	invocationID := resp.Header.Get("x-agent-invocation-id")
+	if invocationID == "" && resp.StatusCode == http.StatusAccepted {
+		responseBody, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("read invocation acceptance response: %w", readErr)
 		}
+		resp.Body = io.NopCloser(bytes.NewReader(responseBody))
+		var accepted struct {
+			InvocationID string `json:"invocation_id"`
+		}
+		if json.Unmarshal(responseBody, &accepted) == nil {
+			invocationID = accepted.InvocationID
+		}
+	}
+	if !raw && invocationID != "" {
+		fmt.Printf("Invocation:   %s\n", invocationID)
 	}
 
 	// Always capture session state from response headers (needed even in raw mode
@@ -1677,6 +1704,20 @@ func (a *InvokeAction) invocationsRemote(ctx context.Context) error {
 		sessionLabel = ""
 	}
 	captureResponseSession(ctx, rc.azdClient, agentKey, sid, resp, sessionLabel)
+
+	if resp.StatusCode < 400 && rc.azdClient != nil && agentKey != "" && invocationID != "" {
+		effectiveSessionID := sid
+		if assigned := resp.Header.Get("x-agent-session-id"); assigned != "" {
+			effectiveSessionID = assigned
+		}
+		if err := newInvocationStateStore(rc.azdClient).Save(ctx, agentKey, savedInvocation{
+			InvocationID: invocationID,
+			SessionID:    effectiveSessionID,
+			APIVersion:   rc.apiVersion,
+		}); err != nil {
+			log.Printf("warning: failed to save invocation %s for later retrieval: %v", invocationID, err)
+		}
+	}
 
 	sessionCode := resp.Header.Get("x-adc-response-details")
 	if err := handleInvocationResponse(
