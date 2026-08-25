@@ -313,6 +313,26 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+func persistAndPrintBackgroundProgress(
+	ctx context.Context,
+	store responseStateStore,
+	agentKey string,
+	record savedBackgroundResponse,
+	printedResponseID *string,
+	writer io.Writer,
+) error {
+	if err := store.Save(ctx, agentKey, record); err != nil {
+		return err
+	}
+	if *printedResponseID == "" {
+		if _, err := fmt.Fprintf(writer, "Response:     %s\n", record.ResponseID); err != nil {
+			return err
+		}
+		*printedResponseID = record.ResponseID
+	}
+	return nil
+}
+
 func decodeResponseSnapshot(body []byte) (responsesSnapshot, error) {
 	var envelope struct {
 		Response json.RawMessage `json:"response"`

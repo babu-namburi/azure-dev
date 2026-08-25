@@ -1425,18 +1425,21 @@ func (a *InvokeAction) responsesRemote(ctx context.Context) error {
 			if progress.ResponseID == "" {
 				return nil
 			}
-			if printedResponseID == "" {
-				fmt.Printf("Response:     %s\n", progress.ResponseID)
-				printedResponseID = progress.ResponseID
-			}
 			savedStatus = progress.Status
-			if err := responseStore.Save(ctx, agentKey, savedBackgroundResponse{
-				ResponseID:     progress.ResponseID,
-				Cursor:         progress.Cursor,
-				Status:         progress.Status,
-				SessionID:      effectiveSessionID,
-				ConversationID: convID,
-			}); err != nil {
+			if err := persistAndPrintBackgroundProgress(
+				ctx,
+				responseStore,
+				agentKey,
+				savedBackgroundResponse{
+					ResponseID:     progress.ResponseID,
+					Cursor:         progress.Cursor,
+					Status:         progress.Status,
+					SessionID:      effectiveSessionID,
+					ConversationID: convID,
+				},
+				&printedResponseID,
+				os.Stdout,
+			); err != nil {
 				return err
 			}
 			if a.flags.noWait {
