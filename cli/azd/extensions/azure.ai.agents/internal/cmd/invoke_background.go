@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -152,10 +153,6 @@ func (a *InvokeAction) responsesCancelRemote(ctx context.Context) error {
 	}
 	defer rc.azdClient.Close()
 
-	if isTerminalResponseStatus(record.Status) {
-		fmt.Printf("Response %s is already %s.\n", record.ResponseID, record.Status)
-		return nil
-	}
 	rc.bearerToken, err = a.acquireBearerToken(ctx)
 	if err != nil {
 		return err
@@ -179,6 +176,21 @@ func (a *InvokeAction) responsesCancelRemote(ctx context.Context) error {
 		return fmt.Errorf("read cancel response: %w", readErr)
 	}
 	if resp.StatusCode >= 400 {
+		handled, handleErr := handleCompletedResponseCancelError(
+			ctx,
+			store,
+			rc.agentKey,
+			record,
+			resp.StatusCode,
+			body,
+			os.Stdout,
+		)
+		if handleErr != nil {
+			return handleErr
+		}
+		if handled {
+			return nil
+		}
 		return fmt.Errorf("POST %s failed with HTTP %d: %s\n%s", cancelURL, resp.StatusCode, resp.Status, body)
 	}
 
@@ -311,6 +323,46 @@ func sleepWithContext(ctx context.Context, delay time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func handleCompletedResponseCancelError(
+	ctx context.Context,
+	store responseStateStore,
+	agentKey string,
+	record *savedBackgroundResponse,
+	statusCode int,
+	body []byte,
+	writer io.Writer,
+) (bool, error) {
+	if statusCode != http.StatusBadRequest {
+		return false, nil
+	}
+	var envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Param   string `json:"param"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil ||
+		envelope.Error.Code != "invalid_request_error" ||
+		envelope.Error.Param != "response_id" ||
+		!strings.EqualFold(strings.TrimSpace(envelope.Error.Message), "Cannot cancel a completed response.") {
+		return false, nil
+	}
+
+	record.Status = "completed"
+	if err := store.Save(ctx, agentKey, *record); err != nil {
+		return true, fmt.Errorf("save completed Response state: %w", err)
+	}
+	if _, err := fmt.Fprintf(
+		writer,
+		"Response %s has already completed; nothing to cancel.\n",
+		record.ResponseID,
+	); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func persistAndPrintBackgroundProgress(

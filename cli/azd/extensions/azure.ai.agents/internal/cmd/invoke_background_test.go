@@ -25,17 +25,19 @@ func TestInvokeCommandBackgroundFlagRegistered(t *testing.T) {
 type orderingResponseStore struct {
 	saved   bool
 	saveErr error
+	record  savedBackgroundResponse
 }
 
 func (s *orderingResponseStore) Get(context.Context, string) (*savedBackgroundResponse, error) {
 	return nil, nil
 }
 
-func (s *orderingResponseStore) Save(context.Context, string, savedBackgroundResponse) error {
+func (s *orderingResponseStore) Save(_ context.Context, _ string, record savedBackgroundResponse) error {
 	if s.saveErr != nil {
 		return s.saveErr
 	}
 	s.saved = true
+	s.record = record
 	return nil
 }
 
@@ -94,6 +96,78 @@ func TestPersistAndPrintBackgroundProgressDoesNotPrintWhenSaveFails(t *testing.T
 	require.EqualError(t, err, "write failed")
 	assert.Empty(t, writer.output.String())
 	assert.Empty(t, printedID)
+}
+
+func TestHandleCompletedResponseCancelError(t *testing.T) {
+	t.Parallel()
+
+	store := &orderingResponseStore{}
+	record := &savedBackgroundResponse{ResponseID: "resp_123", Status: "in_progress"}
+	var output strings.Builder
+	handled, err := handleCompletedResponseCancelError(
+		t.Context(),
+		store,
+		"agent-key",
+		record,
+		400,
+		[]byte(`{"error":{"code":"invalid_request_error","message":"Cannot cancel a completed response.","param":"response_id","type":"invalid_request_error"}}`),
+		&output,
+	)
+
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.True(t, store.saved)
+	assert.Equal(t, "completed", store.record.Status)
+	assert.Equal(t, "completed", record.Status)
+	assert.Equal(t, "Response resp_123 has already completed; nothing to cancel.\n", output.String())
+}
+
+func TestHandleCompletedResponseCancelErrorDoesNotHandleOtherErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+	}{
+		{
+			name:       "different status code",
+			statusCode: 409,
+			body:       `{"error":{"code":"invalid_request_error","message":"Cannot cancel a completed response.","param":"response_id"}}`,
+		},
+		{
+			name:       "different message",
+			statusCode: 400,
+			body:       `{"error":{"code":"invalid_request_error","message":"Cannot cancel a failed response.","param":"response_id"}}`,
+		},
+		{
+			name:       "different parameter",
+			statusCode: 400,
+			body:       `{"error":{"code":"invalid_request_error","message":"Cannot cancel a completed response.","param":"conversation_id"}}`,
+		},
+		{
+			name:       "malformed body",
+			statusCode: 400,
+			body:       `not-json`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store := &orderingResponseStore{}
+			record := &savedBackgroundResponse{ResponseID: "resp_123", Status: "in_progress"}
+			var output strings.Builder
+			handled, err := handleCompletedResponseCancelError(
+				t.Context(), store, "agent-key", record, tt.statusCode, []byte(tt.body), &output,
+			)
+			require.NoError(t, err)
+			assert.False(t, handled)
+			assert.False(t, store.saved)
+			assert.Empty(t, output.String())
+			assert.Equal(t, "in_progress", record.Status)
+		})
+	}
 }
 
 func TestInvokeCommandBackgroundValidation(t *testing.T) {
