@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,8 @@ import (
 )
 
 const maxResponsesSSEEventBytes = 4 * 1024 * 1024
+
+var errResponsesStreamEndedBeforeIdentity = errors.New("Responses stream ended before its identity was received")
 
 type responsesStreamProgress struct {
 	ResponseID string
@@ -235,7 +238,7 @@ func readResponsesSSE(
 	}
 	if requireTerminal && !terminal {
 		if identity == "" {
-			return fmt.Errorf("background Response stream ended before its identity was received")
+			return errResponsesStreamEndedBeforeIdentity
 		}
 		return fmt.Errorf("background Response %s disconnected before reaching a terminal state", identity)
 	}

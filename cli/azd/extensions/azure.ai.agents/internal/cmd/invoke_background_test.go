@@ -170,6 +170,37 @@ func TestHandleCompletedResponseCancelErrorDoesNotHandleOtherErrors(t *testing.T
 	}
 }
 
+func TestPrintTerminalResponseStatus(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []string{"completed", "failed", "incomplete", "cancelled"} {
+		t.Run(status, func(t *testing.T) {
+			t.Parallel()
+			var output strings.Builder
+			terminal, err := printTerminalResponseStatus(&output, &savedBackgroundResponse{
+				ResponseID: "resp_123",
+				Status:     status,
+			})
+			require.NoError(t, err)
+			assert.True(t, terminal)
+			assert.Equal(t, "Status: "+status+"\n", output.String())
+		})
+	}
+}
+
+func TestPrintTerminalResponseStatusIgnoresActiveResponse(t *testing.T) {
+	t.Parallel()
+
+	var output strings.Builder
+	terminal, err := printTerminalResponseStatus(&output, &savedBackgroundResponse{
+		ResponseID: "resp_123",
+		Status:     "in_progress",
+	})
+	require.NoError(t, err)
+	assert.False(t, terminal)
+	assert.Empty(t, output.String())
+}
+
 func TestInvokeCommandBackgroundValidation(t *testing.T) {
 	t.Parallel()
 

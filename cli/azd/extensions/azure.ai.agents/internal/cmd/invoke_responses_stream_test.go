@@ -6,6 +6,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -68,6 +69,14 @@ func TestReadResponsesSSEBackgroundRequiresTerminal(t *testing.T) {
 	err := readResponsesSSE(t.Context(), strings.NewReader(stream), &bytes.Buffer{}, "agent", true, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "disconnected before reaching a terminal state")
+}
+
+func TestReadResponsesSSEEmptyBackgroundStreamReturnsSentinel(t *testing.T) {
+	t.Parallel()
+
+	err := readResponsesSSE(t.Context(), strings.NewReader(""), &bytes.Buffer{}, "agent", true, nil)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, errResponsesStreamEndedBeforeIdentity))
 }
 
 func TestReadResponsesSSESuppressesDuplicateSequence(t *testing.T) {
