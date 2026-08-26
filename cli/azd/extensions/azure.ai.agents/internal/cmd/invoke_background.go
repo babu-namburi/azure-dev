@@ -47,6 +47,14 @@ func guardNoActiveBackgroundResponse(
 	)
 }
 
+func printTerminalResponseStatus(writer io.Writer, record *savedBackgroundResponse) (bool, error) {
+	if !isTerminalResponseStatus(record.Status) {
+		return false, nil
+	}
+	_, err := fmt.Fprintf(writer, "Status: %s\n", record.Status)
+	return true, err
+}
+
 func (a *InvokeAction) responsesContinueRemote(ctx context.Context) error {
 	rc, store, record, err := a.resolveSavedBackgroundResponse(ctx)
 	if err != nil {
@@ -58,6 +66,9 @@ func (a *InvokeAction) responsesContinueRemote(ctx context.Context) error {
 	fmt.Printf("Response:     %s\n", record.ResponseID)
 	fmt.Printf("Session:      %s\n", record.SessionID)
 	fmt.Printf("Conversation: %s\n\n", record.ConversationID)
+	if terminal, err := printTerminalResponseStatus(os.Stdout, record); terminal || err != nil {
+		return err
+	}
 
 	const maxReconnectAttempts = 5
 	for attempt := range maxReconnectAttempts {
@@ -122,6 +133,22 @@ func (a *InvokeAction) responsesContinueRemote(ctx context.Context) error {
 		if streamErr == nil {
 			return nil
 		}
+		if errors.Is(streamErr, errResponsesStreamEndedBeforeIdentity) {
+			if snapshotErr := a.retrieveResponseSnapshot(ctx, rc, store, record); snapshotErr != nil {
+				return errors.Join(
+					fmt.Errorf("Response %s returned no new stream events", record.ResponseID),
+					snapshotErr,
+				)
+			}
+			if terminal, statusErr := printTerminalResponseStatus(os.Stdout, record); terminal || statusErr != nil {
+				return statusErr
+			}
+			return fmt.Errorf(
+				"Response %s is still %s, but no new stream events were available; try `azd ai agent invoke --continue` again",
+				record.ResponseID,
+				record.Status,
+			)
+		}
 		latest, loadErr := store.Get(ctx, rc.agentKey)
 		if loadErr != nil {
 			return errors.Join(streamErr, loadErr)
@@ -129,8 +156,8 @@ func (a *InvokeAction) responsesContinueRemote(ctx context.Context) error {
 		if latest != nil {
 			record = latest
 		}
-		if isTerminalResponseStatus(record.Status) {
-			return streamErr
+		if terminal, statusErr := printTerminalResponseStatus(os.Stdout, record); terminal || statusErr != nil {
+			return statusErr
 		}
 		if attempt+1 == maxReconnectAttempts {
 			if fallbackErr := a.retrieveResponseSnapshot(ctx, rc, store, record); fallbackErr == nil {
