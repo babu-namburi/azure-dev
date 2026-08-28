@@ -282,12 +282,22 @@ support raw output, and is not bounded by --timeout.`,
 					"remove the message to follow or cancel the saved Response",
 				)
 			}
-			if (flags.continueRun || flags.cancel) &&
-				(flags.session != "" || flags.newSession || flags.conversation != "" || flags.newConversation) {
+			if flags.continueRun || flags.cancel {
+				for _, name := range []string{"session-id", "new-session", "conversation-id", "new-conversation"} {
+					if cmd.Flags().Changed(name) {
+						return exterrors.Validation(
+							exterrors.CodeInvalidParameter,
+							"--continue and --cancel use the saved session and conversation",
+							"remove session and conversation overrides",
+						)
+					}
+				}
+			}
+			if (flags.background || flags.continueRun || flags.cancel) && cmd.Flags().Changed("timeout") {
 				return exterrors.Validation(
 					exterrors.CodeInvalidParameter,
-					"--continue and --cancel use the saved session and conversation",
-					"remove session and conversation overrides",
+					"--timeout is not supported with background lifecycle operations",
+					"remove --timeout; attached background work has no overall timeout",
 				)
 			}
 			if flags.background && (flags.continueRun || flags.cancel) {
@@ -1420,56 +1430,63 @@ func (a *InvokeAction) responsesRemote(ctx context.Context) error {
 		a.emitInvokeFailureNextStep(nextstep.InvokeRemote, rc.nextStepName(), resp.Header.Get("x-adc-response-details"))
 		return fmt.Errorf("POST %s failed with HTTP %d: %s\n%s", respURL, resp.StatusCode, resp.Status, string(respBody))
 	}
-	if !a.flags.background && responseStore != nil {
-		if err := responseStore.Delete(ctx, agentKey); err != nil {
-			return fmt.Errorf("clear previous background Response: %w", err)
-		}
-	}
-
 	// Parse SSE stream for agent output.
 	if !a.flags.background {
 		if err := readResponsesSSE(ctx, resp.Body, os.Stdout, rc.name, false, nil); err != nil {
 			return err
+		}
+		if responseStore != nil {
+			if err := responseStore.Delete(ctx, agentKey); err != nil {
+				return fmt.Errorf("clear previous background Response: %w", err)
+			}
 		}
 	} else {
 		effectiveSessionID := sid
 		if assigned := resp.Header.Get("x-agent-session-id"); assigned != "" {
 			effectiveSessionID = assigned
 		}
-		var printedResponseID string
+		progressPersister := newBackgroundProgressPersister(
+			responseStore,
+			agentKey,
+			effectiveSessionID,
+			convID,
+			os.Stdout,
+		)
 		var savedStatus string
-		onProgress := func(progress responsesStreamProgress) error {
-			if progress.ResponseID == "" {
+		streamErr := readResponsesSSE(
+			ctx,
+			resp.Body,
+			os.Stdout,
+			rc.name,
+			true,
+			func(progress responsesStreamProgress) error {
+				savedStatus = progress.Status
+				if err := progressPersister.Apply(ctx, progress); err != nil {
+					return err
+				}
+				if a.flags.noWait && progress.ResponseID != "" {
+					return errBackgroundNoWait
+				}
 				return nil
-			}
-			savedStatus = progress.Status
-			if err := persistAndPrintBackgroundProgress(
-				ctx,
-				responseStore,
-				agentKey,
-				savedBackgroundResponse{
-					ResponseID:     progress.ResponseID,
-					Cursor:         progress.Cursor,
-					Status:         progress.Status,
-					SessionID:      effectiveSessionID,
-					ConversationID: convID,
-				},
-				&printedResponseID,
-				os.Stdout,
-			); err != nil {
-				return err
-			}
-			if a.flags.noWait {
-				return errBackgroundNoWait
-			}
-			return nil
-		}
-		if err := readResponsesSSE(ctx, resp.Body, os.Stdout, rc.name, true, onProgress); err != nil {
-			if !errors.Is(err, errBackgroundNoWait) {
-				return err
-			}
+			},
+		)
+		if errors.Is(streamErr, errBackgroundNoWait) {
 			fmt.Printf("\nStatus: %s\n\nNext:\n  azd ai agent invoke --continue\n", savedStatus)
 			return nil
+		}
+		var flushErr error
+		if ctx.Err() == nil {
+			flushErr = progressPersister.Flush(ctx)
+		}
+		if streamErr != nil || flushErr != nil {
+			if streamErr != nil && ctx.Err() == nil && progressPersister.latest.ResponseID != "" &&
+				isRetryableBackgroundStreamError(streamErr) {
+				return a.responsesContinueRemote(ctx)
+			}
+			// Graceful Ctrl-C detach requires azd core to distinguish an intentional
+			// interrupt from extension-process cancellation. Do not attempt an
+			// extension-only signal workaround or reconnect after context cancellation.
+			return errors.Join(streamErr, flushErr)
 		}
 	}
 	totalDuration := time.Since(invokeStart)

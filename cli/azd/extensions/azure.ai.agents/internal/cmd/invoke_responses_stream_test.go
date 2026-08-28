@@ -68,7 +68,7 @@ func TestReadResponsesSSEBackgroundRequiresTerminal(t *testing.T) {
 
 	err := readResponsesSSE(t.Context(), strings.NewReader(stream), &bytes.Buffer{}, "agent", true, nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "disconnected before reaching a terminal state")
+	assert.Contains(t, err.Error(), "disconnected before terminal state")
 }
 
 func TestReadResponsesSSEEmptyBackgroundStreamReturnsSentinel(t *testing.T) {
@@ -77,6 +77,36 @@ func TestReadResponsesSSEEmptyBackgroundStreamReturnsSentinel(t *testing.T) {
 	err := readResponsesSSE(t.Context(), strings.NewReader(""), &bytes.Buffer{}, "agent", true, nil)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, errResponsesStreamEndedBeforeIdentity))
+}
+
+func TestReadResponsesSSERecoverySnapshotResetsOutput(t *testing.T) {
+	t.Parallel()
+
+	stream := "event: response.in_progress\n" +
+		`data: {"response":{"id":"resp_123","status":"in_progress","output":[{"content":[{"type":"output_text","text":"checkpoint"}]}]},"sequence_number":11}` + "\n\n" +
+		"event: response.output_text.delta\n" +
+		`data: {"delta":"later","sequence_number":12}` + "\n\n" +
+		"event: response.completed\n" +
+		`data: {"response":{"id":"resp_123","status":"completed"},"sequence_number":13}` + "\n\n"
+	var output bytes.Buffer
+	err := readResponsesSSEWithInitialState(
+		t.Context(),
+		strings.NewReader(stream),
+		&output,
+		"agent",
+		true,
+		&responsesStreamInitialState{
+			ResponseID: "resp_123",
+			Cursor:     new(int64(10)),
+			Status:     "in_progress",
+		},
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.Contains(t, output.String(), "--- RESPONSE RECOVERED: OUTPUT RESET TO LAST CHECKPOINT ---")
+	assert.Contains(t, output.String(), "[agent] checkpoint")
+	assert.Contains(t, output.String(), "[agent] later")
 }
 
 func TestReadResponsesSSESuppressesDuplicateSequence(t *testing.T) {
