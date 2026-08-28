@@ -17,12 +17,16 @@ import (
 
 const maxResponsesSSEEventBytes = 4 * 1024 * 1024
 
-var errResponsesStreamEndedBeforeIdentity = errors.New("Responses stream ended before its identity was received")
+var (
+	errResponsesStreamEndedBeforeIdentity = errors.New("Responses stream ended before its identity was received")
+	errResponsesStreamDisconnected        = errors.New("Responses stream disconnected before terminal state")
+)
 
 type responsesStreamProgress struct {
 	ResponseID string
 	Cursor     *int64
 	Status     string
+	EventType  string
 	Terminal   bool
 }
 
@@ -60,12 +64,32 @@ type responsesSSEEvent struct {
 	data []byte
 }
 
+type responsesStreamInitialState struct {
+	ResponseID string
+	Cursor     *int64
+	Status     string
+}
+
 func readResponsesSSE(
 	ctx context.Context,
 	body io.Reader,
 	writer io.Writer,
 	agentName string,
 	requireTerminal bool,
+	onProgress func(responsesStreamProgress) error,
+) error {
+	return readResponsesSSEWithInitialState(
+		ctx, body, writer, agentName, requireTerminal, nil, onProgress,
+	)
+}
+
+func readResponsesSSEWithInitialState(
+	ctx context.Context,
+	body io.Reader,
+	writer io.Writer,
+	agentName string,
+	requireTerminal bool,
+	initialState *responsesStreamInitialState,
 	onProgress func(responsesStreamProgress) error,
 ) error {
 	scanner := bufio.NewScanner(body)
@@ -79,6 +103,13 @@ func readResponsesSSE(
 	var cursor *int64
 	var status string
 	var terminal bool
+	seenInProgress := false
+	if initialState != nil {
+		identity = initialState.ResponseID
+		cursor = initialState.Cursor
+		status = initialState.Status
+		seenInProgress = cursor != nil && *cursor > 1
+	}
 
 	dispatch := func() error {
 		if len(dataLines) == 0 {
@@ -133,7 +164,27 @@ func readResponsesSSE(
 				snapshot.Status = "failed"
 			case "response.incomplete":
 				snapshot.Status = "incomplete"
+			case "response.cancelled":
+				snapshot.Status = "cancelled"
 			}
+		}
+
+		if event.name == "response.in_progress" {
+			if seenInProgress {
+				if printed {
+					if _, err := fmt.Fprintln(writer); err != nil {
+						return err
+					}
+				}
+				if _, err := fmt.Fprintln(writer, "--- RESPONSE RECOVERED: OUTPUT RESET TO LAST CHECKPOINT ---"); err != nil {
+					return err
+				}
+				if err := writeResponsesSnapshot(writer, agentName, snapshot, envelope.Response); err != nil {
+					return err
+				}
+				printed = false
+			}
+			seenInProgress = true
 		}
 
 		switch event.name {
@@ -155,7 +206,7 @@ func readResponsesSSE(
 					return err
 				}
 			}
-		case "response.completed", "response.failed", "response.incomplete":
+		case "response.completed", "response.failed", "response.incomplete", "response.cancelled":
 			terminal = true
 			if printed {
 				if _, err := fmt.Fprintln(writer); err != nil {
@@ -186,6 +237,7 @@ func readResponsesSSE(
 				ResponseID: identity,
 				Cursor:     cursor,
 				Status:     status,
+				EventType:  event.name,
 				Terminal:   terminal,
 			}); err != nil {
 				return err
@@ -231,7 +283,7 @@ func readResponsesSSE(
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading response stream: %w", err)
+		return fmt.Errorf("%w: %v", errResponsesStreamDisconnected, err)
 	}
 	if err := dispatch(); err != nil {
 		return err
@@ -240,7 +292,7 @@ func readResponsesSSE(
 		if identity == "" {
 			return errResponsesStreamEndedBeforeIdentity
 		}
-		return fmt.Errorf("background Response %s disconnected before reaching a terminal state", identity)
+		return fmt.Errorf("%w: %s", errResponsesStreamDisconnected, identity)
 	}
 	return nil
 }
@@ -278,7 +330,7 @@ func writeResponsesSnapshot(
 func isKnownResponsesEvent(event string) bool {
 	switch event {
 	case "response.created", "response.queued", "response.in_progress", "response.output_text.delta",
-		"response.completed", "response.failed", "response.incomplete", "error":
+		"response.completed", "response.failed", "response.incomplete", "response.cancelled", "error":
 		return true
 	default:
 		return false

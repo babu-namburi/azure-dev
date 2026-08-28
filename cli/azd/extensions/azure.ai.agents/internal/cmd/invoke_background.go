@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+const (
+	backgroundCursorPersistInterval   = 3 * time.Second
+	backgroundCursorPersistEventCount = 64
+)
+
 var errBackgroundNoWait = errors.New("background Response identity saved")
 
 func isTerminalResponseStatus(status string) bool {
@@ -26,6 +31,110 @@ func isTerminalResponseStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+func isResponseLifecycleEvent(eventType string) bool {
+	switch eventType {
+	case "response.created", "response.queued", "response.in_progress",
+		"response.completed", "response.failed", "response.incomplete", "response.cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
+type backgroundProgressPersister struct {
+	store              responseStateStore
+	agentKey           string
+	sessionID          string
+	conversationID     string
+	writer             io.Writer
+	now                func() time.Time
+	latest             savedBackgroundResponse
+	persistedResponse  string
+	persistedStatus    string
+	lastPersistedAt    time.Time
+	eventsSincePersist int
+	printedResponseID  bool
+	dirty              bool
+}
+
+func newBackgroundProgressPersister(
+	store responseStateStore,
+	agentKey string,
+	sessionID string,
+	conversationID string,
+	writer io.Writer,
+) *backgroundProgressPersister {
+	return &backgroundProgressPersister{
+		store:          store,
+		agentKey:       agentKey,
+		sessionID:      sessionID,
+		conversationID: conversationID,
+		writer:         writer,
+		now:            time.Now,
+	}
+}
+
+func (p *backgroundProgressPersister) Resume(record savedBackgroundResponse) {
+	p.latest = record
+	p.persistedResponse = record.ResponseID
+	p.persistedStatus = record.Status
+	p.lastPersistedAt = p.now()
+	p.printedResponseID = true
+	p.dirty = false
+}
+
+func (p *backgroundProgressPersister) Apply(ctx context.Context, progress responsesStreamProgress) error {
+	if progress.ResponseID == "" {
+		return nil
+	}
+
+	p.latest = savedBackgroundResponse{
+		ResponseID:         progress.ResponseID,
+		LastSequenceNumber: progress.Cursor,
+		Status:             progress.Status,
+		SessionID:          p.sessionID,
+		ConversationID:     p.conversationID,
+	}
+	p.dirty = true
+	p.eventsSincePersist++
+	now := p.now()
+	shouldPersist := p.persistedResponse == "" ||
+		isResponseLifecycleEvent(progress.EventType) ||
+		progress.Status != p.persistedStatus ||
+		progress.Terminal ||
+		p.eventsSincePersist >= backgroundCursorPersistEventCount ||
+		(!p.lastPersistedAt.IsZero() && now.Sub(p.lastPersistedAt) >= backgroundCursorPersistInterval)
+	if !shouldPersist {
+		return nil
+	}
+	return p.persist(ctx, now)
+}
+
+func (p *backgroundProgressPersister) Flush(ctx context.Context) error {
+	if !p.dirty {
+		return nil
+	}
+	return p.persist(ctx, p.now())
+}
+
+func (p *backgroundProgressPersister) persist(ctx context.Context, now time.Time) error {
+	if err := p.store.Save(ctx, p.agentKey, p.latest); err != nil {
+		return err
+	}
+	if !p.printedResponseID {
+		if _, err := fmt.Fprintf(p.writer, "Response:     %s\n", p.latest.ResponseID); err != nil {
+			return err
+		}
+		p.printedResponseID = true
+	}
+	p.persistedResponse = p.latest.ResponseID
+	p.persistedStatus = p.latest.Status
+	p.lastPersistedAt = now
+	p.eventsSincePersist = 0
+	p.dirty = false
+	return nil
 }
 
 func guardNoActiveBackgroundResponse(
@@ -70,6 +179,15 @@ func (a *InvokeAction) responsesContinueRemote(ctx context.Context) error {
 		return err
 	}
 
+	progressPersister := newBackgroundProgressPersister(
+		store,
+		rc.agentKey,
+		record.SessionID,
+		record.ConversationID,
+		os.Stdout,
+	)
+	progressPersister.Resume(*record)
+
 	const maxReconnectAttempts = 5
 	for attempt := range maxReconnectAttempts {
 		rc.bearerToken, err = a.acquireBearerToken(ctx)
@@ -82,7 +200,7 @@ func (a *InvokeAction) responsesContinueRemote(ctx context.Context) error {
 			record.ResponseID,
 			rc.apiVersion,
 			true,
-			record.Cursor,
+			record.LastSequenceNumber,
 		)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, followURL, nil)
 		if err != nil {
@@ -117,21 +235,41 @@ func (a *InvokeAction) responsesContinueRemote(ctx context.Context) error {
 		}
 
 		onProgress := func(progress responsesStreamProgress) error {
-			if progress.ResponseID != "" {
-				record.ResponseID = progress.ResponseID
+			if progress.ResponseID == "" {
+				progress.ResponseID = record.ResponseID
 			}
-			if progress.Cursor != nil {
-				record.Cursor = progress.Cursor
+			if progress.Status == "" {
+				progress.Status = record.Status
 			}
-			if progress.Status != "" {
-				record.Status = progress.Status
-			}
-			return store.Save(ctx, rc.agentKey, *record)
+			return progressPersister.Apply(ctx, progress)
 		}
-		streamErr := readResponsesSSE(ctx, resp.Body, os.Stdout, rc.name, true, onProgress)
+		streamErr := readResponsesSSEWithInitialState(
+			ctx,
+			resp.Body,
+			os.Stdout,
+			rc.name,
+			true,
+			&responsesStreamInitialState{
+				ResponseID: record.ResponseID,
+				Cursor:     record.LastSequenceNumber,
+				Status:     record.Status,
+			},
+			onProgress,
+		)
 		_ = resp.Body.Close()
-		if streamErr == nil {
+		var flushErr error
+		if ctx.Err() == nil {
+			flushErr = progressPersister.Flush(ctx)
+		}
+		if progressPersister.latest.ResponseID != "" {
+			latest := progressPersister.latest
+			record = &latest
+		}
+		if streamErr == nil && flushErr == nil {
 			return nil
+		}
+		if flushErr != nil {
+			streamErr = errors.Join(streamErr, flushErr)
 		}
 		if errors.Is(streamErr, errResponsesStreamEndedBeforeIdentity) {
 			if snapshotErr := a.retrieveResponseSnapshot(ctx, rc, store, record); snapshotErr != nil {
@@ -321,6 +459,10 @@ func backgroundHTTPClient() *http.Client {
 	return &http.Client{Transport: transport}
 }
 
+func isRetryableBackgroundStreamError(err error) bool {
+	return errors.Is(err, errResponsesStreamDisconnected)
+}
+
 func isRetryableResponseStatus(status int) bool {
 	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
 }
@@ -390,26 +532,6 @@ func handleCompletedResponseCancelError(
 		return true, err
 	}
 	return true, nil
-}
-
-func persistAndPrintBackgroundProgress(
-	ctx context.Context,
-	store responseStateStore,
-	agentKey string,
-	record savedBackgroundResponse,
-	printedResponseID *string,
-	writer io.Writer,
-) error {
-	if err := store.Save(ctx, agentKey, record); err != nil {
-		return err
-	}
-	if *printedResponseID == "" {
-		if _, err := fmt.Fprintf(writer, "Response:     %s\n", record.ResponseID); err != nil {
-			return err
-		}
-		*printedResponseID = record.ResponseID
-	}
-	return nil
 }
 
 func decodeResponseSnapshot(body []byte) (responsesSnapshot, error) {
