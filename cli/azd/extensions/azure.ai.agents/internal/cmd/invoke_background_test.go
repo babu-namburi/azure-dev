@@ -864,21 +864,13 @@ func TestValidateInvokeOperationFlags(t *testing.T) {
 			wantErr: "--no-wait requires --background",
 		},
 		{name: "continue accepts empty input", flags: invokeFlags{continueRun: true}},
-		{
-			name:    "continue rejects message",
-			flags:   invokeFlags{continueRun: true, message: "hello"},
-			wantErr: "--continue and --cancel do not accept a message or --input-file",
-		},
-		{
-			name:    "continue rejects file",
-			flags:   invokeFlags{continueRun: true, inputFile: "request.json"},
-			wantErr: "--continue and --cancel do not accept a message or --input-file",
-		},
+		{name: "continue accepts message", flags: invokeFlags{continueRun: true, message: "hello"}},
+		{name: "continue accepts file", flags: invokeFlags{continueRun: true, inputFile: "request.json"}},
 		{name: "cancel accepts empty input", flags: invokeFlags{cancel: true}},
 		{
 			name:    "cancel rejects input",
 			flags:   invokeFlags{cancel: true, message: "hello"},
-			wantErr: "--continue and --cancel do not accept a message or --input-file",
+			wantErr: "--cancel does not accept a message or --input-file",
 		},
 		{
 			name:    "continue and cancel are exclusive",
